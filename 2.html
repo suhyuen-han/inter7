@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Heart Builder — Rhythm Edition</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/galmuri/dist/galmuri.css" />
+<style>
+  :root{ --bg:#f7eade; --grid:#7b6a49; --ink:#2b2520; }
+
+  html,body{
+    height:100%; margin:0; background:var(--bg);
+    font-family:"Galmuri11", sans-serif;
+    display:grid; place-items:center; color:var(--ink);
+  }
+
+  .board{width:100vw; height:100vh; position:relative; overflow:hidden; border-radius:0px;
+    box-shadow:0 10px 40px rgba(0,0,0,.15)}
+
+  canvas{position:absolute; inset:0; width:100%; height:100%; display:block}
+  #cv { z-index:1; }
+  /* ✅ ECG 오버레이 최상단 */
+  #ui { z-index:9999; pointer-events:none; }
+
+  .hud{ display:flex; flex-direction:column; gap:6px; }
+  .hud-note{ font-size:15px; line-height:1.5; color:#b30000; text-shadow:0 1px 0 rgba(255,255,255,.4); }
+  .hud-row{ font-weight:600; }
+
+  .hud{position:absolute; left:15px; top:30px; display:flex; gap:10px; background:rgba(255,255,255,.55);
+    padding:20px 10px; border-radius:8px; backdrop-filter:blur(30px); z-index:3}
+
+  .help{position:absolute; left:220px; top:250px; transform:translateX(-50%); font-size:14px;
+    background:rgba(255,255,255,.6); padding:6px 12px; border-radius:8px; z-index:3}
+
+  #score, #fill { color:#ff2b2b; }
+
+  .intro{
+    position:absolute; top:850px; left:50%; transform:translateX(-50%);
+    font-size:20px; font-weight:bold; color:#ff2b2b; background:rgba(255,255,255,0.6);
+    padding:10px 18px; border-radius:12px; box-shadow:0 2px 6px rgba(0,0,0,0.1);
+    animation:pulse 2s infinite; z-index:4;
+    transition:opacity .3s ease, transform .3s ease;
+  }
+  @keyframes pulse{
+    0%,100%{opacity:0.9; transform:translateX(-50%) scale(1);}
+    50%{opacity:1; transform:translateX(-50%) scale(1.08);}
+  }
+  .intro.hide{ opacity:0; transform:translateX(-50%) scale(0.98); pointer-events:none; }
+</style>
+</head>
+<body>
+  <div class="intro">❤️ 하트를 완성해서 그의 심장을 뛰게 해주세요!❤️ </div>
+
+  <div class="board" id="board">
+    <canvas id="cv"></canvas>
+    <canvas id="ui"></canvas>
+
+    <div class="hud" id="hud">
+      <div class="hud-note">⚠️<br><br>하트가 완성되지 못하고<br>블록이 차면 환자는 죽습니다!</div>
+      <div class="hud-row">SCORE <b id="score">0</b> · FILL <b id="fill">0%</b></div>
+    </div>
+
+    <div class="help" id="help">스페이스: <b>고정</b> · ←/→: <b>이동</b> · ↑/R: <b>회전</b> · ↓: <b>빠르게 내리기</b></div>
+  </div>
+
+  <audio id="bgm" src="heartbeat.mp3" loop preload="auto" playsinline></audio>
+
+<script>
+/* 인트로 문구 5초 후 페이드아웃 */
+const introEl = document.querySelector('.intro');
+if (introEl) {
+  setTimeout(() => {
+    introEl.classList.add('hide');
+    setTimeout(() => introEl.remove(), 700);
+  }, 5000);
+}
+
+/* ===== 기본 설정 ===== */
+const COLS=20, ROWS=18, BASE=28;
+const SHAPES={I:[[1,1,1,1]],O:[[1,1],[1,1]],T:[[1,1,1],[0,1,0]],L:[[1,0],[1,0],[1,1]],J:[[0,1],[0,1],[1,1]],S:[[0,1,1],[1,1,0]],Z:[[1,1,0],[0,1,1]]};
+
+// 💖 픽셀 하트 실루엣
+const HEART16=[
+".....XXXX....XXXX.....",
+"...XXXXXXXXXXXXXXXX...",
+"..XXXXXXXXXXXXXXXXXX..",
+".XXXXXXXXXXXXXXXXXXXX.",
+".XXXXXXXXXXXXXXXXXXXX.",
+".XXXXXXXXXXXXXXXXXXXX.",
+"..XXXXXXXXXXXXXXXXXX..",
+"...XXXXXXXXXXXXXXX....",
+"....XXXXXXXXXXXXX.....",
+".....XXXXXXXXXXX......",
+"......XXXXXXXXX.......",
+".......XXXXXXX........",
+"........XXXXX.........",
+".........XXX..........",
+"..........X..........."
+];
+
+const HEART=Array.from({length:ROWS},(_,r)=>{
+  const row=(HEART16[r]||"").replace(/\./g,"0").replace(/X/g,"1").split('').map(Number);
+  return Array.from({length:COLS},(_,c)=>{
+    const i=Math.round((c/(COLS-1))*(row.length-1));
+    return row[i]||0;
+  });
+});
+
+/* ===== 캔버스 설정 ===== */
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+const ui=document.getElementById('ui'), uictx=ui.getContext('2d');
+let scale=1, offX=0, offY=0, boardW=0, boardH=0;
+
+/* ✅ 하트 중심(픽셀 좌표) 계산 */
+let heartCX=0, heartCY=0;
+function computeHeartCenter(){
+  let sx=0, sy=0, n=0;
+  for(let r=0;r<ROWS;r++){
+    for(let c=0;c<COLS;c++){
+      if(HEART[r][c]){ sx+=(c+0.5); sy+=(r+0.5); n++; }
+    }
+  }
+  const cellSize = BASE*scale;
+  if(n>0){
+    heartCX = offX + (sx/n)*cellSize;
+    heartCY = offY + (sy/n)*cellSize;
+  } else {
+    heartCX = offX + boardW/2;
+    heartCY = offY + boardH/2;
+  }
+}
+
+function resize(){
+  const w=window.innerWidth*0.98, h=window.innerHeight*0.96;
+  const dpr=window.devicePixelRatio||1;
+  [cv,ui].forEach(c=>{ c.width=w*dpr; c.height=h*dpr; });
+  scale=Math.min(cv.width/(COLS*BASE),cv.height/(ROWS*BASE));
+  boardW=COLS*BASE*scale; boardH=ROWS*BASE*scale;
+  offX=Math.floor((cv.width-boardW)/2);
+  offY=Math.floor((cv.height-boardH)/2);
+  computeHeartCenter();
+  draw(); drawUI(true);
+}
+window.addEventListener('resize',resize);
+
+/* ===== 상태 ===== */
+const grid=Array.from({length:ROWS},()=>Array(COLS).fill(null));
+let piece=null, score=0;
+let GAME_OVER=false;
+
+/* ===== 사운드 ===== */
+const audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+let longTone=null;
+const bgm=document.getElementById('bgm');
+function startBGM(){ if(!bgm)return; bgm.volume=0.5; bgm.currentTime=0; const p=bgm.play(); if(p) p.catch(()=>{}); }
+function stopBGM(){ if(!bgm)return; const fade=setInterval(()=>{ if(bgm.volume>0.05) bgm.volume-=0.05; else { clearInterval(fade); bgm.pause(); bgm.volume=0.5; }},150); }
+function startAudioOnce(){ audioCtx.resume().catch(()=>{}); startBGM(); window.removeEventListener('pointerdown',startAudioOnce); window.removeEventListener('keydown',startAudioOnce); }
+window.addEventListener('pointerdown',startAudioOnce);
+window.addEventListener('keydown',startAudioOnce);
+
+/* ===== 유틸 ===== */
+function rnd(a){return a[Math.floor(Math.random()*a.length)];}
+function rotate(m){const h=m.length,w=m[0].length;return Array.from({length:w},(_,x)=>Array.from({length:h},(_,y)=>m[h-1-y][x]));}
+function canMove(shape,x,y){for(let r=0;r<shape.length;r++)for(let c=0;c<shape[0].length;c++)if(shape[r][c]){const nx=x+c,ny=y+r;if(nx<0||nx>=COLS||ny<0||ny>=ROWS)return false;if(grid[ny][nx])return false;}return true;}
+function beep(freq=500){const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.type='square';o.frequency.value=freq;g.gain.value=0.05;o.connect(g);g.connect(audioCtx.destination);o.start();o.stop(audioCtx.currentTime+0.1);}
+
+/* ===== 피스 ===== */
+function newPiece(){
+  piece={shape:rnd(Object.values(SHAPES)),x:Math.floor(COLS/2)-1,y:0,color:`hsl(${Math.random()*360},70%,70%)`};
+  if(!canMove(piece.shape,piece.x,piece.y)) triggerGameOver();
+}
+function lock(){
+  const {shape,x,y,color}=piece;
+  for(let r=0;r<shape.length;r++)for(let c=0;c<shape[0].length;c++)if(shape[r][c])grid[y+r][x+c]=color;
+  piece=null; score+=10; drawHeartBlock(); newPiece();
+}
+
+/* ===== 하트 진행도 ===== */
+function fillRatio(){let need=0,filled=0;for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++)if(HEART[r][c]){need++;if(grid[r][c])filled++;}return need?filled/need:0;}
+function drawHeartBlock(){if(fillRatio()>=1){for(let r=7;r<11;r++)for(let c=8;c<12;c++)grid[r][c]='#ff5aa6';score+=200;}}
+
+/* ===== 입력 ===== */
+document.addEventListener('keydown',e=>{
+  if(GAME_OVER||!piece) return;
+  if(e.key==='ArrowLeft'&&canMove(piece.shape,piece.x-1,piece.y))piece.x--;
+  if(e.key==='ArrowRight'&&canMove(piece.shape,piece.x+1,piece.y))piece.x++;
+  if(e.key==='ArrowUp'||e.key==='r'||e.key==='R'){const next=rotate(piece.shape);if(canMove(next,piece.x,piece.y))piece.shape=next;}
+  if(e.key===' '){lock();}
+  if(e.key==='ArrowDown'&&canMove(piece.shape,piece.x,piece.y+1))piece.y++;
+  draw();
+});
+
+/* ===== 메인 캔버스 렌더링 ===== */
+function drawCell(c,r,color){
+  const s=BASE*scale, x=offX+c*s, y=offY+r*s;
+  ctx.fillStyle=color; ctx.fillRect(x,y,s,s);
+  ctx.strokeStyle='rgba(0,0,0,0.08)'; ctx.strokeRect(x+0.5,y+0.5,s-1,s-1);
+}
+function drawBG(){
+  ctx.fillStyle='var(--bg)'; ctx.fillRect(0,0,cv.width,cv.height);
+  const s=BASE*scale;
+  const gridColor=getComputedStyle(document.documentElement).getPropertyValue('--grid').trim()||'#7b6a49';
+  ctx.strokeStyle=gridColor; ctx.lineWidth=1; ctx.beginPath();
+  for(let c=0;c<=COLS;c++){ const x=Math.round(offX+c*s)+0.5; ctx.moveTo(x, Math.round(offY)+0.5); ctx.lineTo(x, Math.round(offY+boardH)+0.5); }
+  for(let r=0;r<=ROWS;r++){ const y=Math.round(offY+r*s)+0.5; ctx.moveTo(Math.round(offX)+0.5, y); ctx.lineTo(Math.round(offX+boardW)+0.5, y); }
+  ctx.stroke();
+
+  // 하트 영역 음영
+  ctx.fillStyle='rgba(0,0,0,0.08)';
+  for(let r=0;r<ROWS;r++) for(let c=0;c<COLS;c++)
+    if(HEART[r][c]) ctx.fillRect(offX+c*s, offY+r*s, s, s);
+
+  // 맥박 그라데이션
+  const t = performance.now()/1000;
+  const pulse = (Math.sin(t*2*Math.PI*1.2)+1)/2;
+  const rBase = Math.min(boardW, boardH)*0.20;
+  const rr = rBase*(0.85+0.25*pulse);
+  const g = ctx.createRadialGradient(heartCX, heartCY, 0, heartCX, heartCY, rr);
+  g.addColorStop(0.00, 'rgba(255, 60,  90, 0.75)');
+  g.addColorStop(0.25, 'rgba(255, 90, 120, 0.40)');
+  g.addColorStop(0.55, 'rgba(255,120, 150, 0.18)');
+  g.addColorStop(1.00, 'rgba(255,  0,  40, 0.00)');
+  ctx.globalCompositeOperation='lighter';
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(heartCX, heartCY, rr, 0, Math.PI*2); ctx.fill();
+  ctx.globalCompositeOperation='source-over';
+}
+
+function draw(){
+  if(GAME_OVER){ drawUI(); return; }
+  ctx.clearRect(0,0,cv.width,cv.height);
+  drawBG();
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++) if(grid[r][c]) drawCell(c,r,grid[r][c]);
+  if(piece){
+    const {shape,x,y,color}=piece;
+    for(let r=0;r<shape.length;r++)for(let c=0;c<shape[0].length;c++) if(shape[r][c]) drawCell(x+c,y+r,color);
+  }
+  document.getElementById('score').textContent=String(score);
+  document.getElementById('fill').textContent=Math.round(fillRatio()*100)+'%';
+}
+
+/* ===== 루프 ===== */
+const tempo=120; let beatTime=0;
+function loop(ts){
+  const dt=ts-(loop.prev||ts); loop.prev=ts; beatTime+=dt;
+  if(!GAME_OVER && beatTime>=60000/tempo){
+    beatTime=0; beep(660);
+    if(piece){ if(canMove(piece.shape,piece.x,piece.y+1)) piece.y++; else lock(); }
+    draw();
+  }
+  if(GAME_OVER) drawUI();  // ✅ 오버레이 프레임 갱신
+  requestAnimationFrame(loop);
+}
+function start(){ resize(); newPiece(); requestAnimationFrame(loop); }
+start();
+
+/* ======= 오버레이(UI 캔버스) : 파동 → 평선 ======= */
+let sweepX = 0;                // 현재 스캔 x
+let sweepSpeed = 380;          // px/s
+let lastUIStamp = null;
+const flatStartFrac = 0.22;    // 화면의 62% 지점부터 평선(Flatline) 시작
+
+// ECG 샘플 함수(스파이크 파형). t는 가로 진행 비율을 시간처럼 사용.
+function ecgWave(t){
+  const beat = 0.55;           // 한 박자 구간
+  const ph = t % beat;
+  let y=0;
+  if(ph<0.06) y+=  6*Math.sin(Math.PI*ph/0.06);         // 작은 앞출
+  else if(ph<0.08) y-=14*(1-(ph-0.06)/0.02);            // 급낙
+  else if(ph<0.10) y+=40*(1-(ph-0.08)/0.02);            // 큰 첨두(R)
+  else if(ph<0.14) y-=20*(1-(ph-0.10)/0.04);            // 낙하
+  else if(ph<0.23) y+=10*Math.sin(Math.PI*(ph-0.14)/0.09); // S-T
+  return y;
+}
+
+function triggerGameOver(){
+  if (GAME_OVER) return;
+  GAME_OVER=true;
+
+  const hud=document.getElementById('hud');
+  const help=document.getElementById('help');
+  if (hud)  hud.style.display='none';
+  if (help) help.style.display='none';
+  if (typeof introEl!=='undefined' && introEl) introEl.style.display='none';
+
+  stopBGM();
+
+  // 스윕 초기화 (왼쪽 밖에서 시작)
+  sweepX = -80;
+  lastUIStamp = null;
+
+  // 3초 지속음(선택)
+  const osc=audioCtx.createOscillator(), gain=audioCtx.createGain();
+  osc.type='square'; osc.frequency.value=740; gain.gain.value=0.09;
+  osc.connect(gain); gain.connect(audioCtx.destination); osc.start();
+  longTone={osc,gain};
+  setTimeout(stopLongTone, 3000);
+  setTimeout(()=>{ try{osc.stop();}catch{} }, 3500);
+}
+
+function stopLongTone(){
+  if(longTone){
+    try{
+      longTone.gain.cancelScheduledValues(audioCtx.currentTime);
+      longTone.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime+0.25);
+      longTone.osc.stop(audioCtx.currentTime+0.3);
+    }catch(_){}
+    longTone=null;
+  }
+}
+
+function drawUI(clearOnly=false){
+  const w=ui.width, h=ui.height;
+  uictx.clearRect(0,0,w,h);
+  if(!GAME_OVER || clearOnly) return;
+
+  // 시간 기반 진행
+  const now = performance.now();
+  if(lastUIStamp==null) lastUIStamp = now;
+  const dt = (now - lastUIStamp)/1000;
+  lastUIStamp = now;
+  sweepX += sweepSpeed * dt;
+  if(sweepX > w + 80) sweepX = w + 80; // 끝까지 가면 멈춤
+
+  // 배경
+  uictx.fillStyle='#000';
+  uictx.fillRect(0,0,w,h);
+
+  const midY = Math.round(h*0.5);
+  const flatStartX = w * flatStartFrac;     // 이 지점 전까지 파동, 이후 평선
+  const amp = Math.max(2, Math.min(4, h*0.01)); // 파동 최대 진폭
+
+  // --- 전체 경로를 0 → sweepX까지 그리기 ---
+  uictx.save();
+  uictx.strokeStyle='#ff2b2b';
+  uictx.lineWidth=4;
+  uictx.lineJoin='round';
+  uictx.lineCap='round';
+
+  uictx.beginPath();
+  uictx.moveTo(0, midY);
+  const step = 2; // 샘플링 간격(px)
+  for(let x=0; x<=Math.min(sweepX,w); x+=step){
+    let y = midY;
+    if(x < flatStartX){
+      // 파동: 오른쪽으로 갈수록 서서히 감쇠 → 평선으로 전이
+      const t = x / 70; // 파형의 가로 스케일
+      const env = 1 - Math.min(1, (x/flatStartX)**2.5); // 감쇠(envelope)
+      y = midY - amp * env * ecgWave(t);
+    } // else: y = midY (평선)
+    uictx.lineTo(x, y);
+  }
+  // sweepX가 화면을 넘으면 나머지 구간은 완전 평선으로 이어지게
+  if(sweepX > flatStartX){
+    uictx.lineTo(Math.min(sweepX,w), midY);
+  }
+  uictx.stroke();
+  uictx.restore();
+
+  // 이동하는 헤드(붉은 발광 가로선)
+  if(sweepX <= w){
+    uictx.save();
+    uictx.strokeStyle='#ff4040';
+    uictx.lineWidth=4;
+    uictx.shadowColor='rgba(255,64,64,0.95)';
+    uictx.shadowBlur=14;
+    const headHalf = Math.max(120, Math.min(260, w*0.22)); // 헤드 표시 길이
+    const x1 = Math.max(0, sweepX - headHalf);
+    const x2 = Math.min(w, sweepX + headHalf);
+    uictx.beginPath();
+    uictx.moveTo(x1, midY);
+    uictx.lineTo(x2, midY);
+    uictx.stroke();
+    uictx.restore();
+  }
+
+  // 텍스트
+  uictx.fillStyle='#ff2b2b'; 
+  uictx.textAlign='center';
+  uictx.font=`bold ${Math.max(28, w*0.05)}px Galmuri11, system-ui`;
+  uictx.fillText('GAME OVER', w/2, midY - h*0.18);
+
+  uictx.fillStyle='#bbb';
+  uictx.font=`${Math.max(12, w*0.018)}px Galmuri11, system-ui`;
+  uictx.fillText('Press F5 to restart', w/2, midY - h*0.12);
+}
+
+/* 디버그: G 키로 즉시 게임오버 */
+document.addEventListener('keydown',e=>{
+  if(e.key==='g'||e.key==='G') triggerGameOver();
+});
+</script>
+</body>
+</html>
